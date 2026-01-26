@@ -1,0 +1,63 @@
+data:
+  dataset: "celeba"
+  root: # Your dataset path
+  from_hub: false  # run "python download_dataset.py --output_dir YOUR_PATH" first if you want to use false here
+  repo_name: "electronickale/cmu-10799-celeba64-subset"
+  image_size: 64
+  channels: 3
+  num_workers: 4
+  pin_memory: true
+  augment: true
+
+# TODO: build your model architecture, feel free to add or exclude any of these options
+model:
+  base_channels: # int
+  channel_mult: # list of int [1, 2, 2, 4]
+  num_res_blocks: # TODO
+  attention_resolutions: # list of int
+  num_heads: # int
+  dropout: # float
+  use_scale_shift_norm: # bool
+
+# TODO: your training hyperparameters, feel free to add or exclude any of these options
+training:
+  batch_size: # int
+  learning_rate: # float
+  weight_decay: # float
+  betas: # list of float
+  ema_decay: # float
+  ema_start: # int # This is the start iter to use EMA during sampling at training time, as using EMA at the beginning may not be very meaningful
+  gradient_clip_norm: # float
+  num_iterations: # int
+  log_every: # int
+  sample_every: # int
+  save_every: # int
+  num_samples: # int
+
+# TODO: your ddpm algorithm hyperparameters, feel free to add or exclude any of these options
+ddpm:
+  num_timesteps: # int
+  beta_start: # float
+  beta_end: # float
+
+sampling:
+  num_steps: # int
+  sampler: "ddpm" # for the first hw we only need ddpm sampling, this is a placeholder where you can add more options yourself later
+
+infrastructure:
+  seed: 42
+  device: "cuda"
+  num_gpus: # int # 1 should be ok
+  mixed_precision: # bool # both true and false should work
+  compile_model: false # only tested false
+
+checkpoint:
+  dir: "./checkpoints"
+  resume: null
+
+logging:
+  dir: "./logs"
+  wandb:
+    enabled: true
+    project: "cmu-10799-diffusion"
+    entity: null
