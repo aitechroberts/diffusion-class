@@ -29,6 +29,7 @@ wandb = [
 datasets = [
     "datasets>=2.0.0",
     "huggingface-hub>=0.16.0",
+    "pyarrow<23.0.0",
 ]
 
 [build-system]

@@ -57,7 +57,7 @@ class CelebADataset(Dataset):
         self.repo_name = repo_name
 
         # Build transforms
-        self.transform = self._build_transforms() # TODO write your own image transform function
+        self.transform = self._build_transforms()
 
         # Load dataset based on mode
         if from_hub:
@@ -235,7 +235,13 @@ class CelebADataset(Dataset):
         """Build the preprocessing transforms."""
         transform_list = []
 
-        # TODO: write your image transforms & augmentation
+        # Add data augmentation for training
+        if self.augment and self.split == "train":
+            transform_list.append(transforms.RandomHorizontalFlip(p=0.5))
+
+        # Convert PIL Image to tensor and normalize to [-1, 1]
+        transform_list.append(transforms.ToTensor())  # Converts PIL to tensor [0, 1]
+        transform_list.append(transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]))  # Converts [0, 1] to [-1, 1]
 
         # Only resize if needed (dataset images are already 64x64)
 

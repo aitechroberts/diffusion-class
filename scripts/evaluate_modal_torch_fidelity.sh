@@ -16,7 +16,7 @@ set -e
 
 # Defaults optimized for KID evaluation
 METHOD="ddpm" # (right now you only have ddpm but you will be implementing more methods as hw progresses)
-CHECKPOINT="YOUR_PATH"
+CHECKPOINT="logs/ddpm_modal/ddpm_20260127_012105/checkpoints/ddpm_final.pt"
 METRICS="kid"
 NUM_SAMPLES=1000
 BATCH_SIZE=256

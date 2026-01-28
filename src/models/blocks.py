@@ -134,6 +134,10 @@ class ResBlock(nn.Module):
             self.skip_connection = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         else:
             self.skip_connection = nn.Identity()
+        
+        # Zero initialization for conv2 so ResBlock starts as identity
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
     
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         """
@@ -210,6 +214,10 @@ class AttentionBlock(nn.Module):
         
         # Scale factor for dot-product attention
         self.scale = self.head_dim ** -0.5
+        
+        # Zero initialization for output projection so Attention starts as identity
+        nn.init.zeros_(self.proj_out.weight)
+        nn.init.zeros_(self.proj_out.bias)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

@@ -1,7 +1,5 @@
 """
-Data module for cmu-10799-diffusion.
-
-This module contains dataset loading and preprocessing utilities.
+Data loading and preprocessing utilities.
 """
 
 from .celeba import (

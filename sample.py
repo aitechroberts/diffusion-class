@@ -56,18 +56,23 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
 def save_samples(
     samples: torch.Tensor,
     save_path: str,
-    num_samples: int,
+    nrow: int = 8,
 ) -> None:
     """
-    TODO: save generated samples as images.
+    Save generated samples as images.
 
     Args:
         samples: Generated samples tensor with shape (num_samples, C, H, W).
         save_path: File path to save the image grid.
-        num_samples: Number of samples, used to calculate grid layout.
+        nrow: Number of images per row in the grid.
     """
-
-    raise NotImplementedError
+    from src.data import unnormalize
+    
+    # Unnormalize from [-1, 1] to [0, 1]
+    samples = unnormalize(samples)
+    
+    # Save as grid
+    save_image(samples, save_path, nrow=nrow)
 
 
 def main():
@@ -157,7 +162,6 @@ def main():
                 batch_size=batch_size,
                 image_shape=image_shape,
                 num_steps=num_steps,
-                # TODO: add your arugments here
             )
 
             # Save individual images immediately or collect for grid
@@ -166,7 +170,8 @@ def main():
             else:
                 for i in range(samples.shape[0]):
                     img_path = os.path.join(args.output_dir, f"{sample_idx:06d}.png")
-                    save_samples(samples, img_path, 1)
+                    # save_samples(samples, img_path, 1)
+                    save_samples(samples[i:i+1], img_path, 1) # save each sample individually
                     sample_idx += 1
 
             remaining -= batch_size

@@ -237,8 +237,15 @@ def generate_samples(
     if use_ema:
         ema.apply_shadow()
 
-    samples = None
-    # TODO: sample with your method.sample()
+    # Generate samples using the method's sample function
+    sampling_config = config.get('sampling', {})
+    num_steps = sampling_config.get('num_steps', 1000)
+    
+    samples = method.sample(
+        batch_size=num_samples,
+        image_shape=image_shape,
+        num_steps=num_steps,
+    )
 
     if use_ema:
         ema.restore()
@@ -253,15 +260,21 @@ def save_samples(
     num_samples: int,
 ) -> None:
     """
-    TODO: save generated samples as images.
+    Save generated samples as images in a grid.
 
     Args:
         samples: Generated samples tensor with shape (num_samples, C, H, W).
         save_path: File path to save the image grid.
         num_samples: Number of samples, used to calculate grid layout.
     """
-
-    raise NotImplementedError
+    # Unnormalize from [-1, 1] to [0, 1]
+    samples = unnormalize(samples)
+    
+    # Calculate grid size (try to make it square)
+    nrow = int(math.sqrt(num_samples))
+    
+    # Save as grid
+    save_image(samples, save_path, nrow=nrow)
 
 
 def train(

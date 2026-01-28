@@ -32,11 +32,12 @@ image = (
         "tqdm>=4.64.0",
         "scipy>=1.9.0",
         "wandb>=0.15.0",
-        "datasets>=2.0.0",  # For HuggingFace Hub dataset loading
+        "datasets>=2.0.0",
+        "pyarrow<23.0.0",  # For HuggingFace Hub dataset loading
         "torch-fidelity>=0.3.0",  # Comprehensive evaluation metrics
     )
     # Copy the local project directory into the image
-    .add_local_dir(".", "/root", ignore=[".git", ".venv*", "venv", "__pycache__", "logs", "checkpoints", "*.md", "docs", "environments", "notebooks"])
+    .add_local_dir(".", "/root", ignore=["data",".git", ".venv*", "venv", "__pycache__", "logs", "checkpoints", "*.md", "docs", "environments", "notebooks"])
 )
 
 # Create a persistent volume for checkpoints and data
@@ -460,6 +461,7 @@ def main(
     method: str = "ddpm",
     config: str = None,
     checkpoint: str = None,
+    resume: str = None,  # Path to checkpoint to resume training from (relative to /data/)
     iterations: int = None,
     batch_size: int = None,
     learning_rate: float = None,
@@ -504,6 +506,7 @@ def main(
         result = train_fn.remote(
             method=method,
             config_path=config,
+            resume_from=resume,
             num_iterations=iterations,
             batch_size=batch_size,
             learning_rate=learning_rate,
