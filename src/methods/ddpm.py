@@ -266,6 +266,72 @@ class DDPM(BaseMethod):
         return x
 
     # =========================================================================
+    # DDIM sampling (deterministic, fewer steps, same trained model)
+    # =========================================================================
+
+    @torch.no_grad()
+    def ddim_sample(
+        self,
+        batch_size: int,
+        image_shape: Tuple[int, int, int],
+        num_steps: int = 100,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        DDIM sampling (Song et al., 2020).
+
+        Uses a deterministic update rule that allows far fewer steps than DDPM
+        while reusing the exact same trained noise-prediction model.
+
+        Algorithm:
+            1. Create timestep subsequence [tau_S, ..., tau_1] evenly spaced
+            2. For each step:
+                eps   = eps_theta(x_t, t)
+                x0_hat = (x_t - sqrt(1 - alpha_bar_t) * eps) / sqrt(alpha_bar_t)
+                x_{t_prev} = sqrt(alpha_bar_{t_prev}) * x0_hat
+                             + sqrt(1 - alpha_bar_{t_prev}) * eps
+
+        Args:
+            batch_size: Number of samples to generate
+            image_shape: (C, H, W)
+            num_steps: Number of DDIM steps (e.g. 100 instead of 1000)
+
+        Returns:
+            samples: (batch_size, C, H, W)
+        """
+        self.eval_mode()
+
+        # Build evenly-spaced timestep subsequence from T-1 down to 0
+        # We need num_steps+1 points so we have (t, t_prev) pairs
+        step_indices = torch.linspace(
+            self.num_timesteps - 1, 0, num_steps + 1,
+        ).long().to(self.device)
+
+        # Start from pure noise
+        x = torch.randn(batch_size, *image_shape, device=self.device)
+
+        for i in range(num_steps):
+            t = step_indices[i]
+            t_prev = step_indices[i + 1]
+
+            t_batch = torch.full((batch_size,), t.item(), device=self.device, dtype=torch.long)
+
+            # Predict noise
+            eps = self.model(x, t_batch)
+
+            # alpha_bar values
+            alpha_bar_t = self.alphas_cumprod[t]
+            alpha_bar_prev = self.alphas_cumprod[t_prev] if t_prev >= 0 else torch.tensor(1.0, device=self.device)
+
+            # Predict x_0
+            x0_pred = (x - torch.sqrt(1.0 - alpha_bar_t) * eps) / torch.sqrt(alpha_bar_t)
+
+            # DDIM deterministic step
+            x = torch.sqrt(alpha_bar_prev) * x0_pred + torch.sqrt(1.0 - alpha_bar_prev) * eps
+
+        return x
+
+    # =========================================================================
     # Device / state
     # =========================================================================
 

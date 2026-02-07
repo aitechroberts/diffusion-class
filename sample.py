@@ -1,25 +1,26 @@
 """
-Sampling Script for DDPM (Denoising Diffusion Probabilistic Models)
+Sampling Script for Diffusion / Flow Matching Models
 
 Generate samples from a trained model. By default, saves individual images to avoid
 memory issues with large sample counts. Use --grid to generate a single grid image.
 
+Supported methods:
+    ddpm           - DDPM sampling (standard reverse process)
+    ddim           - DDIM sampling (deterministic, fewer steps, reuses DDPM checkpoint)
+    flow_matching  - Flow Matching sampling (Euler integration)
+
 Usage:
-    # Sample from DDPM (saves individual images to ./samples/)
-    python sample.py --checkpoint checkpoints/ddpm_final.pt --method ddpm --num_samples 64
+    # DDPM sampling
+    python sample.py --checkpoint ckpt.pt --method ddpm --num_samples 64
 
-    # With custom number of sampling steps
-    python sample.py --checkpoint checkpoints/ddpm_final.pt --method ddpm --num_steps 500
+    # DDIM sampling (uses the same DDPM checkpoint, fewer steps)
+    python sample.py --checkpoint ckpt.pt --method ddim --num_steps 100 --num_samples 64
 
-    # Generate a grid image instead of individual images
-    python sample.py --checkpoint checkpoints/ddpm_final.pt --method ddpm --num_samples 64 --grid
+    # Flow Matching sampling
+    python sample.py --checkpoint ckpt.pt --method flow_matching --num_steps 100
 
-    # Save individual images to custom directory
-    python sample.py --checkpoint checkpoints/ddpm_final.pt --method ddpm --output_dir my_samples
-
-What you need to implement:
-- Incorporate your sampling scheme to this pipeline
-- Save generated samples as images for logging
+    # Generate a grid image
+    python sample.py --checkpoint ckpt.pt --method ddpm --num_samples 16 --grid
 """
 
 import os
@@ -33,7 +34,7 @@ from tqdm import tqdm
 
 from src.models import create_model_from_config
 from src.data import save_image
-from src.methods import DDPM
+from src.methods import DDPM, FlowMatching
 from src.utils import EMA
 
 
@@ -80,8 +81,8 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
     parser.add_argument('--method', type=str, required=True,
-                       choices=['ddpm'], # You can add more later
-                       help='Method used for training (currently only ddpm is supported)')
+                       choices=['ddpm', 'ddim', 'flow_matching'],
+                       help='Sampling method: ddpm, ddim (reuses DDPM checkpoint), or flow_matching')
     parser.add_argument('--num_samples', type=int, default=64,
                        help='Number of samples to generate')
     parser.add_argument('--output_dir', type=str, default='samples',
@@ -122,10 +123,13 @@ def main():
     model, config, ema = load_checkpoint(args.checkpoint, device)
     
     # Create method
-    if args.method == 'ddpm':
+    if args.method in ('ddpm', 'ddim'):
+        # Both DDPM and DDIM use the same trained DDPM model
         method = DDPM.from_config(model, config, device)
+    elif args.method == 'flow_matching':
+        method = FlowMatching.from_config(model, config, device)
     else:
-        raise ValueError(f"Unknown method: {args.method}. Only 'ddpm' is currently supported.")
+        raise ValueError(f"Unknown method: {args.method}. Supported: ddpm, ddim, flow_matching.")
     
     # Apply EMA weights
     if not args.no_ema:
@@ -158,11 +162,18 @@ def main():
 
             num_steps = args.num_steps or config['sampling']['num_steps']
 
-            samples = method.sample(
-                batch_size=batch_size,
-                image_shape=image_shape,
-                num_steps=num_steps,
-            )
+            if args.method == 'ddim':
+                samples = method.ddim_sample(
+                    batch_size=batch_size,
+                    image_shape=image_shape,
+                    num_steps=num_steps,
+                )
+            else:
+                samples = method.sample(
+                    batch_size=batch_size,
+                    image_shape=image_shape,
+                    num_steps=num_steps,
+                )
 
             # Save individual images immediately or collect for grid
             if args.grid:
