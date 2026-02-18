@@ -21,18 +21,18 @@ model:
 
 # Training hyperparameters (same as DDPM)
 training:
-  batch_size: 256
-  learning_rate: 0.0002
+  batch_size: 32
+  learning_rate: 0.0001 
   weight_decay: 0.0
   betas: [0.9, 0.999]
   ema_decay: 0.9999
   ema_start: 5000
   gradient_clip_norm: 1.0
-  num_iterations: 100000
+  num_iterations: 50000
   log_every: 100
   sample_every: 5000
   save_every: 10000
-  num_samples: 16
+  num_samples: 4
 
 # Flow Matching algorithm hyperparameters
 flow_matching:
