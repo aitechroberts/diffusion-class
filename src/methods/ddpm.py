@@ -3,7 +3,7 @@ Denoising Diffusion Probabilistic Models (DDPM)
 """
 
 import math
-from typing import Dict, Tuple, Optional, Literal, List
+from typing import Callable, Dict, List, Tuple, Optional, Literal
 
 import torch
 import torch.nn as nn
@@ -330,6 +330,280 @@ class DDPM(BaseMethod):
             x = torch.sqrt(alpha_bar_prev) * x0_pred + torch.sqrt(1.0 - alpha_bar_prev) * eps
 
         return x
+
+    # =========================================================================
+    # RX-DDIM sampling (Richardson extrapolation on DDIM, same trained model)
+    # Reference: Choi et al., "Enhanced Diffusion Sampling via Extrapolation
+    #            with Multiple ODE Solutions", ICLR 2025
+    # =========================================================================
+
+    @torch.no_grad()
+    def _rx_ddim_core(
+        self,
+        batch_size: int,
+        image_shape: Tuple[int, int, int],
+        num_steps: int,
+        k: int,
+        extrapolate_fn: Callable[
+            [torch.Tensor, torch.Tensor, List[float]], torch.Tensor
+        ],
+    ) -> torch.Tensor:
+        """Shared RX-DDIM loop with a pluggable extrapolation strategy.
+
+        Args:
+            batch_size: Number of samples to generate.
+            image_shape: (C, H, W).
+            num_steps: Total DDIM steps.
+            k: Extrapolation interval (extrapolate every k steps).
+            extrapolate_fn: ``fn(x_k_step, x_1_step, lam_js) -> x``
+                where *lam_js* is the list of per-sub-step lambda values
+                in gamma-space.
+
+        Returns:
+            samples: (batch_size, C, H, W)
+        """
+        self.eval_mode()
+
+        step_indices = torch.linspace(
+            self.num_timesteps - 1, 0, num_steps + 1,
+        ).long().to(self.device)
+
+        gammas = torch.sqrt(
+            (1.0 - self.alphas_cumprod) / self.alphas_cumprod
+        )
+
+        x = torch.randn(batch_size, *image_shape, device=self.device)
+
+        i = 0
+        while i < num_steps:
+            block_size = min(k, num_steps - i)
+
+            x_k_step = x.clone()
+            first_eps = None
+
+            for j in range(block_size):
+                t = step_indices[i + j]
+                t_prev = step_indices[i + j + 1]
+                t_batch = torch.full(
+                    (batch_size,), t.item(),
+                    device=self.device, dtype=torch.long,
+                )
+
+                eps = self.model(x_k_step, t_batch)
+                if j == 0:
+                    first_eps = eps
+
+                ab_t = self.alphas_cumprod[t]
+                ab_prev = self.alphas_cumprod[t_prev]
+
+                x0_pred = (
+                    (x_k_step - torch.sqrt(1.0 - ab_t) * eps)
+                    / torch.sqrt(ab_t)
+                )
+                x_k_step = (
+                    torch.sqrt(ab_prev) * x0_pred
+                    + torch.sqrt(1.0 - ab_prev) * eps
+                )
+
+            if block_size == k and k > 1:
+                t_start = step_indices[i]
+                t_end = step_indices[i + k]
+
+                ab_start = self.alphas_cumprod[t_start]
+                ab_end = self.alphas_cumprod[t_end]
+
+                x0_pred_1 = (
+                    (x - torch.sqrt(1.0 - ab_start) * first_eps)
+                    / torch.sqrt(ab_start)
+                )
+                x_1_step = (
+                    torch.sqrt(ab_end) * x0_pred_1
+                    + torch.sqrt(1.0 - ab_end) * first_eps
+                )
+
+                gamma_start = gammas[t_start]
+                gamma_end = gammas[t_end]
+                h = gamma_start - gamma_end
+
+                lam_js: List[float] = []
+                for j in range(block_size):
+                    g_curr = gammas[step_indices[i + j]]
+                    g_next = gammas[step_indices[i + j + 1]]
+                    lam_js.append(((g_curr - g_next) / h).item())
+
+                x = extrapolate_fn(x_k_step, x_1_step, lam_js)
+            else:
+                x = x_k_step
+
+            i += block_size
+
+        return x
+
+    # ----- Standard RX-DDIM (original) ------------------------------------
+
+    @torch.no_grad()
+    def rx_ddim_sample(
+        self,
+        batch_size: int,
+        image_shape: Tuple[int, int, int],
+        num_steps: int = 100,
+        k: int = 2,
+        **kwargs,
+    ) -> torch.Tensor:
+        """RX-DDIM sampling — Richardson extrapolation applied to DDIM.
+
+        Every *k* DDIM steps, two ODE solutions over the same time interval
+        are combined to cancel the leading truncation-error term:
+
+            x_tilde = (x_k_step - S * x_1_step) / (1 - S)      [Eq. 18]
+
+        where S = sum_j lambda_j^p and p = 2 for first-order DDIM.
+
+        Args:
+            batch_size: Number of samples to generate.
+            image_shape: (C, H, W).
+            num_steps: Total DDIM steps (e.g. 50 or 100).
+            k: Extrapolation interval (k = 2 recommended).
+
+        Returns:
+            samples: (batch_size, C, H, W)
+        """
+        p = 2
+
+        def _standard_extrapolate(
+            x_k_step: torch.Tensor,
+            x_1_step: torch.Tensor,
+            lam_js: List[float],
+        ) -> torch.Tensor:
+            S = sum(lj ** p for lj in lam_js)
+            return (x_k_step - S * x_1_step) / (1.0 - S)
+
+        return self._rx_ddim_core(
+            batch_size, image_shape, num_steps, k, _standard_extrapolate,
+        )
+
+    # ----- Condition-Number-Gated RX-DDIM (CNG) ---------------------------
+
+    @torch.no_grad()
+    def cng_rx_ddim_sample(
+        self,
+        batch_size: int,
+        image_shape: Tuple[int, int, int],
+        num_steps: int = 100,
+        k: int = 2,
+        tau: float = 0.3,
+        s_param: float = 0.1,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Condition-Number-Gated RX-DDIM sampling.
+
+        Blends the Richardson-extrapolated result with the plain DDIM
+        result using a sigmoid gate on the conditioning factor
+        kappa = |1 - S|.  When kappa is large (many steps, well-
+        conditioned), the gate passes through full RX-DPM.  When kappa
+        approaches zero (few steps, ill-conditioned), the gate smoothly
+        falls back to plain DDIM, preventing the explosive error
+        amplification that makes standard RX-DPM produce noise at
+        very low step counts.
+
+        Args:
+            batch_size: Number of samples to generate.
+            image_shape: (C, H, W).
+            num_steps: Total DDIM steps.
+            k: Extrapolation interval (k = 2 recommended).
+            tau: Sigmoid centre — kappa values below this shift toward
+                 DDIM; above toward full RX.
+            s_param: Sigmoid sharpness (smaller = sharper transition).
+
+        Returns:
+            samples: (batch_size, C, H, W)
+        """
+        p = 2
+
+        def _cng_extrapolate(
+            x_k_step: torch.Tensor,
+            x_1_step: torch.Tensor,
+            lam_js: List[float],
+        ) -> torch.Tensor:
+            S = sum(lj ** p for lj in lam_js)
+            kappa = abs(1.0 - S)
+            alpha = torch.sigmoid(
+                torch.tensor((kappa - tau) / s_param, device=x_k_step.device)
+            )
+            x_rx = (x_k_step - S * x_1_step) / (1.0 - S)
+            return alpha * x_rx + (1.0 - alpha) * x_k_step
+
+        return self._rx_ddim_core(
+            batch_size, image_shape, num_steps, k, _cng_extrapolate,
+        )
+
+    # ----- Dual-Order RX-DDIM (DO) ----------------------------------------
+
+    @torch.no_grad()
+    def do_rx_ddim_sample(
+        self,
+        batch_size: int,
+        image_shape: Tuple[int, int, int],
+        num_steps: int = 100,
+        k: int = 2,
+        p1: int = 2,
+        p2: int = 3,
+        do_threshold: float = 0.1,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Dual-Order RX-DDIM sampling — embedded-RK-style error estimation.
+
+        Computes Richardson extrapolation at two candidate error orders
+        *p1* and *p2* simultaneously.  The relative disagreement between
+        the two estimates signals whether the polynomial error assumption
+        holds at the current step size.  A sigmoid gate blends the p1
+        estimate with plain DDIM based on this disagreement, providing
+        automatic adaptation without hand-tuned step-count thresholds.
+
+        Analogous to embedded Runge-Kutta methods (RK45 / Dormand-Prince)
+        which use two different order solutions to estimate local error
+        and decide whether to accept or reject a step.
+
+        Args:
+            batch_size: Number of samples to generate.
+            image_shape: (C, H, W).
+            num_steps: Total DDIM steps.
+            k: Extrapolation interval (k = 2 recommended).
+            p1: Primary assumed error order (default 2 for Euler/DDIM).
+            p2: Secondary order used for comparison (default 3).
+            do_threshold: Relative disagreement level at the sigmoid
+                midpoint — larger values tolerate more disagreement
+                before gating toward DDIM.
+
+        Returns:
+            samples: (batch_size, C, H, W)
+        """
+
+        def _do_extrapolate(
+            x_k_step: torch.Tensor,
+            x_1_step: torch.Tensor,
+            lam_js: List[float],
+        ) -> torch.Tensor:
+            S1 = sum(lj ** p1 for lj in lam_js)
+            S2 = sum(lj ** p2 for lj in lam_js)
+            x_rx1 = (x_k_step - S1 * x_1_step) / (1.0 - S1)
+            x_rx2 = (x_k_step - S2 * x_1_step) / (1.0 - S2)
+            disagreement = (
+                torch.norm(x_rx1 - x_rx2)
+                / (torch.norm(x_k_step) + 1e-8)
+            )
+            alpha = torch.sigmoid(
+                torch.tensor(
+                    (1.0 / (disagreement.item() + 1e-8)
+                     - 1.0 / do_threshold) * do_threshold,
+                    device=x_k_step.device,
+                )
+            )
+            return alpha * x_rx1 + (1.0 - alpha) * x_k_step
+
+        return self._rx_ddim_core(
+            batch_size, image_shape, num_steps, k, _do_extrapolate,
+        )
 
     # =========================================================================
     # Device / state

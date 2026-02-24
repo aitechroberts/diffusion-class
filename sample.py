@@ -7,6 +7,9 @@ memory issues with large sample counts. Use --grid to generate a single grid ima
 Supported methods:
     ddpm           - DDPM sampling (standard reverse process)
     ddim           - DDIM sampling (deterministic, fewer steps, reuses DDPM checkpoint)
+    rx_ddim        - RX-DDIM sampling (DDIM + Richardson extrapolation, reuses DDPM checkpoint)
+    cng_rx_ddim    - Condition-Number-Gated RX-DDIM (adaptive gate on extrapolation)
+    do_rx_ddim     - Dual-Order RX-DDIM (embedded-RK-style error estimation)
     flow_matching  - Flow Matching sampling (Euler integration)
 
 Usage:
@@ -15,6 +18,15 @@ Usage:
 
     # DDIM sampling (uses the same DDPM checkpoint, fewer steps)
     python sample.py --checkpoint ckpt.pt --method ddim --num_steps 100 --num_samples 64
+
+    # RX-DDIM sampling (improved DDIM with extrapolation, same checkpoint)
+    python sample.py --checkpoint ckpt.pt --method rx_ddim --num_steps 100 --k 2 --num_samples 64
+
+    # CNG-RX-DDIM (condition-number-gated, good for very few steps)
+    python sample.py --checkpoint ckpt.pt --method cng_rx_ddim --num_steps 5 --k 2 --tau 0.3 --s_param 0.1
+
+    # DO-RX-DDIM (dual-order adaptive, self-calibrating)
+    python sample.py --checkpoint ckpt.pt --method do_rx_ddim --num_steps 5 --k 2 --do_threshold 0.1
 
     # Flow Matching sampling
     python sample.py --checkpoint ckpt.pt --method flow_matching --num_steps 100
@@ -81,8 +93,8 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
     parser.add_argument('--method', type=str, required=True,
-                       choices=['ddpm', 'ddim', 'flow_matching'],
-                       help='Sampling method: ddpm, ddim (reuses DDPM checkpoint), or flow_matching')
+                       choices=['ddpm', 'ddim', 'rx_ddim', 'cng_rx_ddim', 'do_rx_ddim', 'flow_matching'],
+                       help='Sampling method: ddpm, ddim, rx_ddim, cng_rx_ddim, do_rx_ddim (reuse DDPM ckpt), or flow_matching')
     parser.add_argument('--num_samples', type=int, default=64,
                        help='Number of samples to generate')
     parser.add_argument('--output_dir', type=str, default='samples',
@@ -99,6 +111,18 @@ def main():
     # Sampling arguments
     parser.add_argument('--num_steps', type=int, default=None,
                        help='Number of sampling steps (default: from config)')
+    parser.add_argument('--k', type=int, default=2,
+                       help='Extrapolation interval for RX-DDIM variants (default: 2)')
+    parser.add_argument('--tau', type=float, default=0.3,
+                       help='CNG-RX-DDIM: sigmoid centre for condition-number gate (default: 0.3)')
+    parser.add_argument('--s_param', type=float, default=0.1,
+                       help='CNG-RX-DDIM: sigmoid sharpness (default: 0.1)')
+    parser.add_argument('--p1', type=int, default=2,
+                       help='DO-RX-DDIM: primary assumed error order (default: 2)')
+    parser.add_argument('--p2', type=int, default=3,
+                       help='DO-RX-DDIM: secondary error order for comparison (default: 3)')
+    parser.add_argument('--do_threshold', type=float, default=0.1,
+                       help='DO-RX-DDIM: disagreement threshold for gating (default: 0.1)')
     
     # Other options
     parser.add_argument('--no_ema', action='store_true',
@@ -123,8 +147,7 @@ def main():
     model, config, ema = load_checkpoint(args.checkpoint, device)
     
     # Create method
-    if args.method in ('ddpm', 'ddim'):
-        # Both DDPM and DDIM use the same trained DDPM model
+    if args.method in ('ddpm', 'ddim', 'rx_ddim', 'cng_rx_ddim', 'do_rx_ddim'):
         method = DDPM.from_config(model, config, device)
     elif args.method == 'flow_matching':
         method = FlowMatching.from_config(model, config, device)
@@ -167,6 +190,32 @@ def main():
                     batch_size=batch_size,
                     image_shape=image_shape,
                     num_steps=num_steps,
+                )
+            elif args.method == 'rx_ddim':
+                samples = method.rx_ddim_sample(
+                    batch_size=batch_size,
+                    image_shape=image_shape,
+                    num_steps=num_steps,
+                    k=args.k,
+                )
+            elif args.method == 'cng_rx_ddim':
+                samples = method.cng_rx_ddim_sample(
+                    batch_size=batch_size,
+                    image_shape=image_shape,
+                    num_steps=num_steps,
+                    k=args.k,
+                    tau=args.tau,
+                    s_param=args.s_param,
+                )
+            elif args.method == 'do_rx_ddim':
+                samples = method.do_rx_ddim_sample(
+                    batch_size=batch_size,
+                    image_shape=image_shape,
+                    num_steps=num_steps,
+                    k=args.k,
+                    p1=args.p1,
+                    p2=args.p2,
+                    do_threshold=args.do_threshold,
                 )
             else:
                 samples = method.sample(

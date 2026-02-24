@@ -206,6 +206,7 @@ def sample(
     checkpoint: str = "checkpoints/ddpm/ddpm_final.pt",
     num_samples: int = None,
     num_steps: int = None,
+    k: int = None,
 ):
     """
     Generate samples from a trained model.
@@ -236,6 +237,8 @@ def sample(
         cmd.extend(["--num_samples", str(num_samples)])
     if num_steps is not None:
         cmd.extend(["--num_steps", str(num_steps)])
+    if k is not None:
+        cmd.extend(["--k", str(k)])
 
     subprocess.run(cmd, check=True)
     volume.commit()
@@ -297,6 +300,7 @@ def evaluate_torch_fidelity(
     num_samples: int = 5000,
     batch_size: int = 128,
     num_steps: int = None,
+    k: int = None,
     override: bool = False,
 ):
     """
@@ -404,6 +408,8 @@ def evaluate_torch_fidelity(
 
         if num_steps:
             sample_cmd.extend(["--num_steps", str(num_steps)])
+        if k is not None:
+            sample_cmd.extend(["--k", str(k)])
 
         subprocess.run(sample_cmd, check=True)
         print(f"Generated {num_samples} samples to {generated_dir}")
@@ -452,6 +458,170 @@ def evaluate_torch_fidelity(
 
 
 # =============================================================================
+# Benchmark Functions (RX-DDIM vs DDIM evaluation)
+# =============================================================================
+
+def _ensure_dataset_images():
+    """Extract dataset images from Arrow format if not already cached."""
+    import os
+    dataset_arrow_path = "/data/celeba"
+    dataset_images_path = "/data/celeba_images"
+
+    if not os.path.exists(dataset_images_path):
+        print("Extracting dataset images for torch-fidelity...")
+        from datasets import load_from_disk
+
+        dataset = load_from_disk(dataset_arrow_path)
+        train_data = dataset["train"]
+        os.makedirs(dataset_images_path, exist_ok=True)
+
+        for idx, item in enumerate(train_data):
+            item["image"].save(os.path.join(dataset_images_path, f"{idx:06d}.png"))
+            if (idx + 1) % 1000 == 0:
+                print(f"  Extracted {idx + 1}/{len(train_data)} images")
+
+        volume.commit()
+    return dataset_images_path
+
+
+@app.function(image=image, gpu="L40S", timeout=60 * 60 * 2, volumes={"/data": volume})
+def benchmark_kid_single(
+    method: str,
+    num_steps: int,
+    checkpoint: str,
+    num_samples: int = 5000,
+    batch_size: int = 32,
+    k: int = 2,
+) -> str:
+    """
+    KID worker: generate samples for one (method, step_count) config and compute KID.
+
+    Returns a CSV result line: "method,num_steps,nfe,kid_mean,kid_std"
+    """
+    import subprocess
+
+    dataset_path = _ensure_dataset_images()
+    checkpoint_path = f"/data/{checkpoint}"
+    output_dir = f"/data/benchmark/{method}_{num_steps}"
+
+    cmd = [
+        "python", "/root/evaluate_rx_ddim.py",
+        "--mode", "kid",
+        "--checkpoint", checkpoint_path,
+        "--method", method,
+        "--num_steps", str(num_steps),
+        "--num_samples", str(num_samples),
+        "--batch_size", str(batch_size),
+        "--k", str(k),
+        "--output_dir", output_dir,
+        "--dataset_path", dataset_path,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    print(result.stdout)
+    if result.stderr:
+        print(result.stderr)
+    result.check_returncode()
+
+    # Parse the RESULT: line from stdout
+    for line in result.stdout.strip().splitlines():
+        if line.startswith("RESULT:"):
+            volume.commit()
+            return line[len("RESULT:"):]
+
+    volume.commit()
+    raise RuntimeError(f"No RESULT line found in output:\n{result.stdout}")
+
+
+@app.function(image=image, timeout=60, volumes={"/data": volume})
+def write_kid_csv(kid_rows: list) -> str:
+    """Write collected KID result lines to a CSV on the volume."""
+    import os
+    output_csv = "/data/benchmark/kid_vs_nfe.csv"
+    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+    with open(output_csv, "w") as f:
+        f.write("method,num_steps,nfe,kid_mean,kid_std\n")
+        for row in kid_rows:
+            f.write(row + "\n")
+    volume.commit()
+    return output_csv
+
+
+@app.function(image=image, gpu="L40S", timeout=60 * 60, volumes={"/data": volume})
+def benchmark_timing(
+    checkpoint: str,
+    step_counts: str = "1,3,5,10,25,50,100",
+    batch_size: int = 32,
+    num_warmup: int = 2,
+    num_trials: int = 5,
+    k: int = 2,
+) -> str:
+    """Run wall-clock timing benchmark for DDIM and RX-DDIM."""
+    import subprocess
+
+    checkpoint_path = f"/data/{checkpoint}"
+    output_csv = "/data/benchmark/timing_benchmark.csv"
+
+    cmd = [
+        "python", "/root/benchmark_timing.py",
+        "--checkpoint", checkpoint_path,
+        "--step_counts", step_counts,
+        "--batch_size", str(batch_size),
+        "--num_warmup", str(num_warmup),
+        "--num_trials", str(num_trials),
+        "--k", str(k),
+        "--output_csv", output_csv,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    print(result.stdout)
+    if result.stderr:
+        print(result.stderr)
+    result.check_returncode()
+
+    volume.commit()
+    return output_csv
+
+
+@app.function(image=image, gpu="L40S", timeout=60 * 60, volumes={"/data": volume})
+def benchmark_l2(
+    checkpoint: str,
+    num_samples_l2: int = 8,
+    k: int = 2,
+    seed: int = 42,
+) -> str:
+    """
+    L2 worker: run full L2 error sweep on one GPU, write CSV to volume.
+
+    Returns the path to the output CSV.
+    """
+    import subprocess
+
+    checkpoint_path = f"/data/{checkpoint}"
+    output_csv = "/data/benchmark/l2_vs_nfe.csv"
+
+    cmd = [
+        "python", "/root/evaluate_rx_ddim.py",
+        "--mode", "l2",
+        "--checkpoint", checkpoint_path,
+        "--rx_step_counts", "1,5,10,25,50",
+        "--num_samples_l2", str(num_samples_l2),
+        "--k", str(k),
+        "--seed", str(seed),
+        "--output_csv", output_csv,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    print(result.stdout)
+    if result.stderr:
+        print(result.stderr)
+    result.check_returncode()
+
+    volume.commit()
+    return output_csv
+
+
+# =============================================================================
 # CLI Entry Points
 # =============================================================================
 
@@ -467,9 +637,11 @@ def main(
     learning_rate: float = None,
     num_samples: int = None,
     num_steps: int = None,
+    k: int = None,
     metrics: str = None,
     overfit_single_batch: bool = False,
     override: bool = False,
+    seed: int = None,
 ):
     """
     Main entry point for Modal CLI.
@@ -521,6 +693,7 @@ def main(
             checkpoint=checkpoint,
             num_samples=num_samples,
             num_steps=num_steps,
+            k=k,
         )
         print(result)
     elif action == "evaluate" or action == "evaluate_torch_fidelity":
@@ -540,9 +713,90 @@ def main(
             eval_kwargs['batch_size'] = batch_size
         if num_steps is not None:
             eval_kwargs['num_steps'] = num_steps
+        if k is not None:
+            eval_kwargs['k'] = k
 
         result = evaluate_torch_fidelity.remote(**eval_kwargs)
         print(result)
+    elif action == "benchmark_timing":
+        if checkpoint is None:
+            checkpoint = "logs/ddpm_modal/ddpm_20260127_162352/checkpoints/ddpm_final.pt"
+
+        timing_k = k if k is not None else 2
+        timing_batch_size = batch_size if batch_size is not None else 32
+
+        print(f"Launching timing benchmark on Modal (L40S)...")
+        result_path = benchmark_timing.remote(
+            checkpoint=checkpoint,
+            batch_size=timing_batch_size,
+            k=timing_k,
+        )
+        print(f"\nTiming results written to: {result_path}")
+        print("Download with:")
+        print("  modal volume get cmu-10799-diffusion-data benchmark/timing_benchmark.csv .")
+
+    elif action == "benchmark":
+        if checkpoint is None:
+            checkpoint = "checkpoints/ddpm_modal/ddpm_final.pt"
+
+        kid_num_samples = num_samples if num_samples is not None else 5000
+        kid_batch_size = batch_size if batch_size is not None else 32
+        kid_k = k if k is not None else 2
+        benchmark_seed = seed if seed is not None else 42
+
+        # RX-DDIM steps and their DDIM 2x counterparts
+        configs = [
+            ("rx_ddim", 1), ("ddim", 2),
+            ("rx_ddim", 5), ("ddim", 10),
+            ("rx_ddim", 10), ("ddim", 20),
+            ("rx_ddim", 25), ("ddim", 50),
+            ("rx_ddim", 50), ("ddim", 100),
+        ]
+
+        print(f"Launching benchmark: {len(configs)} KID workers + 1 L2 worker")
+        print(f"  KID: {kid_num_samples} samples, batch_size={kid_batch_size}, k={kid_k}")
+        print(f"  L2:  8 samples, seed={benchmark_seed}")
+
+        # Launch L2 evaluation
+        l2_handle = benchmark_l2.spawn(
+            checkpoint=checkpoint,
+            num_samples_l2=8,
+            k=kid_k,
+            seed=benchmark_seed,
+        )
+
+        # Launch KID workers in parallel
+        kid_handles = []
+        for method_name, steps in configs:
+            h = benchmark_kid_single.spawn(
+                method=method_name,
+                num_steps=steps,
+                checkpoint=checkpoint,
+                num_samples=kid_num_samples,
+                batch_size=kid_batch_size,
+                k=kid_k,
+            )
+            kid_handles.append((method_name, steps, h))
+
+        # Collect KID results
+        print("\nWaiting for KID workers...")
+        kid_rows = []
+        for method_name, steps, h in kid_handles:
+            result_line = h.get()
+            kid_rows.append(result_line)
+            print(f"  {method_name} steps={steps}: {result_line}")
+
+        # Write kid_vs_nfe.csv to volume
+        kid_csv_path = write_kid_csv.remote(kid_rows)
+        print(f"KID results written to: {kid_csv_path}")
+
+        # Wait for L2
+        l2_path = l2_handle.get()
+        print(f"L2 results written to: {l2_path}")
+
+        print("\nBenchmark complete! Download results with:")
+        print("  modal volume get cmu-10799-diffusion-data benchmark/kid_vs_nfe.csv .")
+        print("  modal volume get cmu-10799-diffusion-data benchmark/l2_vs_nfe.csv .")
     else:
         print(f"Unknown action: {action}")
-        print("Valid actions: download, train, sample, evaluate")
+        print("Valid actions: download, train, sample, evaluate, benchmark, benchmark_timing")
