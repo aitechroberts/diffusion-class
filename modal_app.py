@@ -192,6 +192,65 @@ TRAIN_FUNCTIONS = {
 
 
 # =============================================================================
+# Progressive Distillation Function
+# =============================================================================
+
+@app.function(
+    image=image,
+    gpu="L40S",
+    timeout=60 * 60 * 24,  # 24 hours (5 stages x ~4h each)
+    volumes={"/data": volume},
+    secrets=[modal.Secret.from_name("wandb-api-key")],
+)
+def distill(
+    config_path: str = "configs/pd_distill.yaml",
+    teacher_checkpoint: str = None,
+    resume_stage: int = None,
+    resume_checkpoint: str = None,
+):
+    """Run Progressive Distillation training on Modal."""
+    import os
+    import sys
+    import yaml
+    import tempfile
+    import subprocess
+
+    sys.path.insert(0, "/root")
+
+    with open(f"/root/{config_path}", "r") as f:
+        config = yaml.safe_load(f)
+
+    config["data"]["root"] = "/data/celeba"
+    config["data"]["repo_name"] = "electronickale/cmu-10799-celeba64-subset"
+    config["logging"]["dir"] = "/data/logs/pd_distill"
+
+    if teacher_checkpoint is not None:
+        config["distillation"]["teacher_checkpoint"] = f"/data/{teacher_checkpoint}"
+    elif not config["distillation"]["teacher_checkpoint"].startswith("/data"):
+        config["distillation"]["teacher_checkpoint"] = (
+            f"/data/{config['distillation']['teacher_checkpoint']}"
+        )
+
+    os.makedirs(config["logging"]["dir"], exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tf:
+        yaml.safe_dump(config, tf)
+        tmp_cfg = tf.name
+
+    cmd = ["python", "/root/train_distill.py", "--config", tmp_cfg]
+    if resume_stage is not None:
+        cmd.extend(["--resume_stage", str(resume_stage)])
+    if resume_checkpoint is not None:
+        cmd.extend(["--resume_checkpoint", f"/data/{resume_checkpoint}"])
+
+    subprocess.run(cmd, check=True)
+    volume.commit()
+
+    os.remove(tmp_cfg)
+    return "Progressive Distillation complete!"
+
+
+# =============================================================================
 # Sampling Function
 # =============================================================================
 
@@ -207,6 +266,10 @@ def sample(
     num_samples: int = None,
     num_steps: int = None,
     k: int = None,
+    distilled_checkpoint: str = None,
+    dws_tau: float = None,
+    n_rx_steps: int = None,
+    extrapolation: str = None,
 ):
     """
     Generate samples from a trained model.
@@ -239,6 +302,14 @@ def sample(
         cmd.extend(["--num_steps", str(num_steps)])
     if k is not None:
         cmd.extend(["--k", str(k)])
+    if distilled_checkpoint is not None:
+        cmd.extend(["--distilled_checkpoint", f"/data/{distilled_checkpoint}"])
+    if dws_tau is not None:
+        cmd.extend(["--dws_tau", str(dws_tau)])
+    if n_rx_steps is not None:
+        cmd.extend(["--n_rx_steps", str(n_rx_steps)])
+    if extrapolation is not None:
+        cmd.extend(["--extrapolation", extrapolation])
 
     subprocess.run(cmd, check=True)
     volume.commit()
@@ -302,6 +373,10 @@ def evaluate_torch_fidelity(
     num_steps: int = None,
     k: int = None,
     override: bool = False,
+    distilled_checkpoint: str = None,
+    dws_tau: float = None,
+    n_rx_steps: int = None,
+    extrapolation: str = None,
 ):
     """
     Evaluate using torch-fidelity CLI.
@@ -309,13 +384,17 @@ def evaluate_torch_fidelity(
     Uses the fidelity command to compute metrics directly.
 
     Args:
-        method: 'ddpm'
+        method: Sampling method (ddpm, ddim, rx_ddim, dws_rx_ddim, etc.)
         checkpoint: Path to checkpoint (relative to /data)
         metrics: Comma-separated: 'fid', 'kid', 'is' (default: 'fid,kid')
         num_samples: Number of samples to generate
         batch_size: Batch size
         num_steps: Sampling steps (optional)
         override: Force regenerate samples even if they exist
+        distilled_checkpoint: DWS-RX-DDIM: path to PD model (relative to /data)
+        dws_tau: DWS-RX-DDIM: re-noising level
+        n_rx_steps: DWS-RX-DDIM: number of RX refinement steps
+        extrapolation: DWS-RX-DDIM: extrapolation strategy (standard, cng, do)
     """
     import sys
     import subprocess
@@ -410,6 +489,14 @@ def evaluate_torch_fidelity(
             sample_cmd.extend(["--num_steps", str(num_steps)])
         if k is not None:
             sample_cmd.extend(["--k", str(k)])
+        if distilled_checkpoint is not None:
+            sample_cmd.extend(["--distilled_checkpoint", f"/data/{distilled_checkpoint}"])
+        if dws_tau is not None:
+            sample_cmd.extend(["--dws_tau", str(dws_tau)])
+        if n_rx_steps is not None:
+            sample_cmd.extend(["--n_rx_steps", str(n_rx_steps)])
+        if extrapolation is not None:
+            sample_cmd.extend(["--extrapolation", extrapolation])
 
         subprocess.run(sample_cmd, check=True)
         print(f"Generated {num_samples} samples to {generated_dir}")
@@ -533,6 +620,185 @@ def benchmark_kid_single(
     raise RuntimeError(f"No RESULT line found in output:\n{result.stdout}")
 
 
+@app.function(image=image, gpu="L40S", timeout=60 * 60 * 6, volumes={"/data": volume})
+def evaluate_pd_sweep(
+    checkpoint: str,
+    step_counts: str = "1,2,3,4,5,10",
+    num_samples: int = 5000,
+    batch_size: int = 32,
+) -> str:
+    """Run the full PD KID sweep across step_counts on one GPU.
+
+    checkpoint: path relative to /data/ (e.g.
+        logs/pd_distill/pd_distill_20260225_235450/checkpoints/pd_stage5_final.pt)
+
+    Returns the path to the output CSV on the volume.
+    """
+    import subprocess
+
+    dataset_path = _ensure_dataset_images()
+    checkpoint_path = f"/data/{checkpoint}"
+    output_csv = "/data/benchmark/kid_pd_vs_nfe.csv"
+
+    cmd = [
+        "python", "/root/evaluate_pd.py",
+        "--mode", "sweep",
+        "--checkpoint", checkpoint_path,
+        "--step_counts", step_counts,
+        "--num_samples", str(num_samples),
+        "--batch_size", str(batch_size),
+        "--dataset_path", dataset_path,
+        "--output_csv", output_csv,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    print(result.stdout)
+    if result.stderr:
+        print(result.stderr)
+    result.check_returncode()
+
+    volume.commit()
+    return output_csv
+
+
+@app.function(image=image, gpu="L40S", timeout=60 * 60 * 3, volumes={"/data": volume})
+def evaluate_pd_fid(
+    checkpoint: str,
+    num_steps: int = 1,
+    num_samples: int = 5000,
+    batch_size: int = 32,
+) -> str:
+    """Run FID evaluation for PD v-prediction model at given step count."""
+    import subprocess
+
+    dataset_path = _ensure_dataset_images()
+    checkpoint_path = f"/data/{checkpoint}"
+    output_dir = f"/data/benchmark/pd_fid_{num_steps}steps"
+
+    cmd = [
+        "python", "/root/evaluate_pd.py",
+        "--mode", "fid",
+        "--checkpoint", checkpoint_path,
+        "--num_steps", str(num_steps),
+        "--num_samples", str(num_samples),
+        "--batch_size", str(batch_size),
+        "--dataset_path", dataset_path,
+        "--output_dir", output_dir,
+    ]
+
+    subprocess.run(cmd, check=True)
+    volume.commit()
+    return f"FID complete (steps={num_steps}). Samples at {output_dir}"
+
+
+@app.function(image=image, gpu="L40S", timeout=60 * 60 * 8, volumes={"/data": volume})
+def evaluate_dws_sweep(
+    base_checkpoint: str,
+    distilled_checkpoint: str,
+    rx_step_counts: str = "1,2,3,4,5,10",
+    tau: float = 0.3,
+    k: int = 2,
+    extrapolation: str = "standard",
+    num_samples: int = 5000,
+    batch_size: int = 32,
+) -> str:
+    """Run DWS-RX-DDIM KID sweep across n_rx_steps on one GPU."""
+    import subprocess
+
+    dataset_path = _ensure_dataset_images()
+    output_csv = "/data/benchmark/kid_dws_vs_nfe.csv"
+
+    cmd = [
+        "python", "/root/evaluate_dws.py",
+        "--base_checkpoint", f"/data/{base_checkpoint}",
+        "--distilled_checkpoint", f"/data/{distilled_checkpoint}",
+        "--rx_step_counts", rx_step_counts,
+        "--tau", str(tau),
+        "--k", str(k),
+        "--extrapolation", extrapolation,
+        "--num_samples", str(num_samples),
+        "--batch_size", str(batch_size),
+        "--dataset_path", dataset_path,
+        "--output_csv", output_csv,
+    ]
+
+    subprocess.run(cmd, check=True)
+    volume.commit()
+    return output_csv
+
+
+@app.function(image=image, gpu="L40S", timeout=60 * 60 * 8, volumes={"/data": volume})
+def evaluate_tau_sweep(
+    base_checkpoint: str,
+    distilled_checkpoint: str,
+    tau_values: str = "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9",
+    n_rx_steps: int = 1,
+    k: int = 2,
+    extrapolation: str = "standard",
+    num_samples: int = 5000,
+    batch_size: int = 32,
+) -> str:
+    """Run DWS-RX-DDIM KID sweep across tau values on one GPU."""
+    import subprocess
+
+    dataset_path = _ensure_dataset_images()
+    output_csv = "/data/benchmark/kid_dws_tau_sweep.csv"
+
+    cmd = [
+        "python", "/root/evaluate_tau_sweep.py",
+        "--base_checkpoint", f"/data/{base_checkpoint}",
+        "--distilled_checkpoint", f"/data/{distilled_checkpoint}",
+        "--tau_values", tau_values,
+        "--n_rx_steps", str(n_rx_steps),
+        "--k", str(k),
+        "--extrapolation", extrapolation,
+        "--num_samples", str(num_samples),
+        "--batch_size", str(batch_size),
+        "--dataset_path", dataset_path,
+        "--output_csv", output_csv,
+    ]
+
+    subprocess.run(cmd, check=True)
+    volume.commit()
+    return output_csv
+
+
+@app.function(image=image, gpu="L40S", timeout=60 * 60 * 10, volumes={"/data": volume})
+def evaluate_dws_grid(
+    base_checkpoint: str,
+    distilled_checkpoint: str,
+    tau_values: str = "0.05,0.1,0.2,0.3,0.4",
+    rx_step_counts: str = "1,2,3,4,5,10",
+    k: int = 2,
+    extrapolation: str = "standard",
+    num_samples: int = 5000,
+    batch_size: int = 32,
+) -> str:
+    """Run DWS-RX-DDIM 2D grid sweep (tau x n_rx_steps) on one GPU."""
+    import subprocess
+
+    dataset_path = _ensure_dataset_images()
+    output_csv = "/data/benchmark/kid_dws_grid.csv"
+
+    cmd = [
+        "python", "/root/evaluate_dws_grid.py",
+        "--base_checkpoint", f"/data/{base_checkpoint}",
+        "--distilled_checkpoint", f"/data/{distilled_checkpoint}",
+        "--tau_values", tau_values,
+        "--rx_step_counts", rx_step_counts,
+        "--k", str(k),
+        "--extrapolation", extrapolation,
+        "--num_samples", str(num_samples),
+        "--batch_size", str(batch_size),
+        "--dataset_path", dataset_path,
+        "--output_csv", output_csv,
+    ]
+
+    subprocess.run(cmd, check=True)
+    volume.commit()
+    return output_csv
+
+
 @app.function(image=image, timeout=60, volumes={"/data": volume})
 def write_kid_csv(kid_rows: list) -> str:
     """Write collected KID result lines to a CSV on the volume."""
@@ -632,6 +898,8 @@ def main(
     config: str = None,
     checkpoint: str = None,
     resume: str = None,  # Path to checkpoint to resume training from (relative to /data/)
+    resume_stage: int = None,  # For distill: 0-based stage index to resume from
+    resume_checkpoint: str = None,  # For distill: mid-stage checkpoint to resume from
     iterations: int = None,
     batch_size: int = None,
     learning_rate: float = None,
@@ -642,6 +910,10 @@ def main(
     overfit_single_batch: bool = False,
     override: bool = False,
     seed: int = None,
+    distilled_checkpoint: str = None,
+    dws_tau: float = None,
+    n_rx_steps: int = None,
+    extrapolation: str = None,
 ):
     """
     Main entry point for Modal CLI.
@@ -685,6 +957,16 @@ def main(
             overfit_single_batch=overfit_single_batch,
         )
         print(result)
+    elif action == "distill":
+        dist_kwargs = {"config_path": config or "configs/pd_distill.yaml"}
+        if checkpoint is not None:
+            dist_kwargs["teacher_checkpoint"] = checkpoint
+        if resume_stage is not None:
+            dist_kwargs["resume_stage"] = resume_stage
+        if resume_checkpoint is not None:
+            dist_kwargs["resume_checkpoint"] = resume_checkpoint
+        result = distill.remote(**dist_kwargs)
+        print(result)
     elif action == "sample":
         if checkpoint is None:
             checkpoint = f"checkpoints/{method}/{method}_final.pt"
@@ -694,6 +976,10 @@ def main(
             num_samples=num_samples,
             num_steps=num_steps,
             k=k,
+            distilled_checkpoint=distilled_checkpoint,
+            dws_tau=dws_tau,
+            n_rx_steps=n_rx_steps,
+            extrapolation=extrapolation,
         )
         print(result)
     elif action == "evaluate" or action == "evaluate_torch_fidelity":
@@ -715,6 +1001,14 @@ def main(
             eval_kwargs['num_steps'] = num_steps
         if k is not None:
             eval_kwargs['k'] = k
+        if distilled_checkpoint is not None:
+            eval_kwargs['distilled_checkpoint'] = distilled_checkpoint
+        if dws_tau is not None:
+            eval_kwargs['dws_tau'] = dws_tau
+        if n_rx_steps is not None:
+            eval_kwargs['n_rx_steps'] = n_rx_steps
+        if extrapolation is not None:
+            eval_kwargs['extrapolation'] = extrapolation
 
         result = evaluate_torch_fidelity.remote(**eval_kwargs)
         print(result)
@@ -797,6 +1091,77 @@ def main(
         print("\nBenchmark complete! Download results with:")
         print("  modal volume get cmu-10799-diffusion-data benchmark/kid_vs_nfe.csv .")
         print("  modal volume get cmu-10799-diffusion-data benchmark/l2_vs_nfe.csv .")
+    elif action == "evaluate_pd":
+        if checkpoint is None:
+            raise ValueError("--checkpoint is required for --action evaluate_pd")
+        result = evaluate_pd_sweep.remote(
+            checkpoint=checkpoint,
+            num_samples=num_samples or 5000,
+            batch_size=batch_size or 32,
+        )
+        print(f"PD KID sweep complete. CSV at: {result}")
+        print("Download with:")
+        print("  modal volume get cmu-10799-diffusion-data benchmark/kid_pd_vs_nfe.csv .")
+    elif action == "evaluate_pd_fid":
+        if checkpoint is None:
+            raise ValueError("--checkpoint is required for --action evaluate_pd_fid")
+        result = evaluate_pd_fid.remote(
+            checkpoint=checkpoint,
+            num_steps=num_steps or 1,
+            num_samples=num_samples or 5000,
+            batch_size=batch_size or 32,
+        )
+        print(result)
+    elif action == "evaluate_dws":
+        if checkpoint is None:
+            raise ValueError("--checkpoint (base DDPM) is required for --action evaluate_dws")
+        if distilled_checkpoint is None:
+            raise ValueError("--distilled-checkpoint (PD model) is required for --action evaluate_dws")
+        result = evaluate_dws_sweep.remote(
+            base_checkpoint=checkpoint,
+            distilled_checkpoint=distilled_checkpoint,
+            tau=dws_tau or 0.3,
+            k=k or 2,
+            extrapolation=extrapolation or "standard",
+            num_samples=num_samples or 5000,
+            batch_size=batch_size or 32,
+        )
+        print(f"DWS KID sweep complete. CSV at: {result}")
+        print("Download with:")
+        print("  modal volume get cmu-10799-diffusion-data benchmark/kid_dws_vs_nfe.csv .")
+    elif action == "evaluate_tau":
+        if checkpoint is None:
+            raise ValueError("--checkpoint (base DDPM) is required for --action evaluate_tau")
+        if distilled_checkpoint is None:
+            raise ValueError("--distilled-checkpoint (PD model) is required for --action evaluate_tau")
+        result = evaluate_tau_sweep.remote(
+            base_checkpoint=checkpoint,
+            distilled_checkpoint=distilled_checkpoint,
+            n_rx_steps=n_rx_steps or 1,
+            k=k or 2,
+            extrapolation=extrapolation or "standard",
+            num_samples=num_samples or 5000,
+            batch_size=batch_size or 32,
+        )
+        print(f"Tau sweep complete. CSV at: {result}")
+        print("Download with:")
+        print("  modal volume get cmu-10799-diffusion-data benchmark/kid_dws_tau_sweep.csv .")
+    elif action == "evaluate_dws_grid":
+        if checkpoint is None:
+            raise ValueError("--checkpoint (base DDPM) is required for --action evaluate_dws_grid")
+        if distilled_checkpoint is None:
+            raise ValueError("--distilled-checkpoint (PD model) is required for --action evaluate_dws_grid")
+        result = evaluate_dws_grid.remote(
+            base_checkpoint=checkpoint,
+            distilled_checkpoint=distilled_checkpoint,
+            k=k or 2,
+            extrapolation=extrapolation or "standard",
+            num_samples=num_samples or 5000,
+            batch_size=batch_size or 32,
+        )
+        print(f"DWS grid sweep complete. CSV at: {result}")
+        print("Download with:")
+        print("  modal volume get cmu-10799-diffusion-data benchmark/kid_dws_grid.csv .")
     else:
         print(f"Unknown action: {action}")
-        print("Valid actions: download, train, sample, evaluate, benchmark, benchmark_timing")
+        print("Valid actions: download, train, distill, sample, evaluate, evaluate_pd, evaluate_dws, evaluate_tau, evaluate_dws_grid, benchmark, benchmark_timing")

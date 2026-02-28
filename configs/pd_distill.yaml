@@ -1,0 +1,76 @@
+# Progressive Distillation Configuration (v3 — v-prediction, DDIM teacher)
+#
+# Implements Salimans & Ho (ICLR 2022), Algorithm 2:
+#   - Plain DDIM teacher (epsilon-prediction, 2 steps per block)
+#   - Student uses v-prediction for gradient stability
+#   - Unweighted MSE in v-space (= SNR+1 weighted x-space MSE)
+#   - Clean 2x halving: 32 -> 16 -> 8 -> 4 -> 2 -> 1
+#   - All stages save checkpoints every 200 iterations for LCSC
+#
+# Usage:
+#   python train_distill.py --config configs/pd_distill.yaml
+#   python train_distill.py --config configs/pd_distill.yaml --teacher_checkpoint /path/to/ckpt.pt
+
+data:
+  dataset: "celeba"
+  root: "/data/celeba"
+  from_hub: true
+  repo_name: "electronickale/cmu-10799-celeba64-subset"
+  image_size: 64
+  channels: 3
+  num_workers: 4
+  pin_memory: true
+  augment: true
+
+model:
+  base_channels: 128
+  channel_mult: [1, 2, 2, 2]
+  num_res_blocks: 2
+  attention_resolutions: [16]
+  num_heads: 4
+  dropout: 0.0              # no dropout during distillation (per paper Appendix E)
+  use_scale_shift_norm: true
+
+training:
+  batch_size: 32
+  learning_rate: 0.0002
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  ema_decay: 0.9999
+  gradient_clip_norm: 1.0
+  num_iterations: 50000      # per stage (paper uses 50k, 100k for final stages)
+  log_every: 100
+  sample_every: 5000         # generate v-pred DDIM samples for visual QA
+  num_samples: 16
+
+ddpm:
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+
+distillation:
+  teacher_checkpoint: "logs/ddpm_modal/ddpm_20260127_162352/checkpoints/ddpm_final.pt"
+  teacher_type: "ddim"
+  save_every: 200
+  max_nan_consecutive: 50
+
+  stages:
+    # Clean 2x halving (5 stages, 32 -> 1)
+    - { teacher_steps: 32, student_steps: 16 }
+    - { teacher_steps: 16, student_steps:  8 }
+    - { teacher_steps:  8, student_steps:  4 }
+    - { teacher_steps:  4, student_steps:  2 }
+    - { teacher_steps:  2, student_steps:  1 }
+
+infrastructure:
+  seed: 42
+  device: "cuda"
+  num_gpus: 1
+  mixed_precision: true
+
+logging:
+  dir: "./logs/pd_distill"
+  wandb:
+    enabled: true
+    project: "cmu-10799-diffusion"
+    entity: null

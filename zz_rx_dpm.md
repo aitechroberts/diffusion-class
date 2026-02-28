@@ -42,3 +42,16 @@ zip -r hw3.zip \
   pyproject.toml \
   setup-uv.sh \
   -x "src/__pycache__/*" "src/*/__pycache__/*"
+
+modal run modal_app.py \
+  --action evaluate \
+  --method rx_ddim \
+  --checkpoint logs/ddpm_modal/ddpm_20260127_162352/checkpoints/ddpm_final.pt \
+  --num-steps 5 \
+  --k 2 \
+  --metrics kid \
+  --num-samples 5000
+
+
+Steps 5: 0.04011031
+Steps 100: 0.00327682

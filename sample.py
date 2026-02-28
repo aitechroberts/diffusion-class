@@ -10,6 +10,8 @@ Supported methods:
     rx_ddim        - RX-DDIM sampling (DDIM + Richardson extrapolation, reuses DDPM checkpoint)
     cng_rx_ddim    - Condition-Number-Gated RX-DDIM (adaptive gate on extrapolation)
     do_rx_ddim     - Dual-Order RX-DDIM (embedded-RK-style error estimation)
+    dws_rx_ddim    - Distillation Warm-Started RX-DDIM (distill + renoise + RX refine)
+    pd             - Progressive Distillation v-prediction (1-step or multi-step DDIM)
     flow_matching  - Flow Matching sampling (Euler integration)
 
 Usage:
@@ -28,8 +30,14 @@ Usage:
     # DO-RX-DDIM (dual-order adaptive, self-calibrating)
     python sample.py --checkpoint ckpt.pt --method do_rx_ddim --num_steps 5 --k 2 --do_threshold 0.1
 
+    # DWS-RX-DDIM (distillation warm-start + RX refinement, 3 total NFE)
+    python sample.py --checkpoint ckpt.pt --method dws_rx_ddim --distilled_checkpoint pd_final.pt --dws_tau 0.3 --n_rx_steps 2
+
     # Flow Matching sampling
     python sample.py --checkpoint ckpt.pt --method flow_matching --num_steps 100
+
+    # PD v-prediction (Progressive Distillation 1-step)
+    python sample.py --checkpoint pd_stage5_final.pt --method pd --num_steps 1 --num_samples 8 --grid
 
     # Generate a grid image
     python sample.py --checkpoint ckpt.pt --method ddpm --num_samples 16 --grid
@@ -66,6 +74,32 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
     return model, config, ema
 
 
+@torch.no_grad()
+def ddim_sample_v_pred(model, alphas_cumprod, image_shape, num_steps, batch_size, device):
+    """DDIM sampling with a v-prediction model (Progressive Distillation)."""
+    num_timesteps = len(alphas_cumprod)
+    schedule = torch.linspace(num_timesteps - 1, 0, num_steps + 1).long().to(device)
+    z = torch.randn(batch_size, *image_shape, device=device)
+
+    for i in range(num_steps):
+        t = schedule[i].item()
+        t_next = schedule[i + 1].item()
+        abar_t = alphas_cumprod[t]
+        abar_next = alphas_cumprod[t_next]
+        alpha_t = torch.sqrt(abar_t)
+        sigma_t = torch.sqrt(1.0 - abar_t)
+
+        t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
+        v = model(z, t_batch)
+
+        x0 = alpha_t * z - sigma_t * v
+        eps = sigma_t * z + alpha_t * v
+
+        z = torch.sqrt(abar_next) * x0 + torch.sqrt(1.0 - abar_next) * eps
+
+    return z
+
+
 def save_samples(
     samples: torch.Tensor,
     save_path: str,
@@ -93,8 +127,8 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
     parser.add_argument('--method', type=str, required=True,
-                       choices=['ddpm', 'ddim', 'rx_ddim', 'cng_rx_ddim', 'do_rx_ddim', 'flow_matching'],
-                       help='Sampling method: ddpm, ddim, rx_ddim, cng_rx_ddim, do_rx_ddim (reuse DDPM ckpt), or flow_matching')
+                       choices=['ddpm', 'ddim', 'rx_ddim', 'cng_rx_ddim', 'do_rx_ddim', 'dws_rx_ddim', 'pd', 'flow_matching'],
+                       help='Sampling method')
     parser.add_argument('--num_samples', type=int, default=64,
                        help='Number of samples to generate')
     parser.add_argument('--output_dir', type=str, default='samples',
@@ -123,6 +157,15 @@ def main():
                        help='DO-RX-DDIM: secondary error order for comparison (default: 3)')
     parser.add_argument('--do_threshold', type=float, default=0.1,
                        help='DO-RX-DDIM: disagreement threshold for gating (default: 0.1)')
+    parser.add_argument('--distilled_checkpoint', type=str, default=None,
+                       help='DWS-RX-DDIM: path to distilled (PD) model checkpoint')
+    parser.add_argument('--dws_tau', type=float, default=0.3,
+                       help='DWS-RX-DDIM: re-noising level (default: 0.3)')
+    parser.add_argument('--n_rx_steps', type=int, default=2,
+                       help='DWS-RX-DDIM: number of RX refinement steps (default: 2)')
+    parser.add_argument('--extrapolation', type=str, default='standard',
+                       choices=['standard', 'cng', 'do'],
+                       help='DWS-RX-DDIM: extrapolation strategy for refinement (default: standard)')
     
     # Other options
     parser.add_argument('--no_ema', action='store_true',
@@ -147,12 +190,34 @@ def main():
     model, config, ema = load_checkpoint(args.checkpoint, device)
     
     # Create method
-    if args.method in ('ddpm', 'ddim', 'rx_ddim', 'cng_rx_ddim', 'do_rx_ddim'):
+    distilled_model = None
+    pd_alphas_cumprod = None
+    if args.method in ('ddpm', 'ddim', 'rx_ddim', 'cng_rx_ddim', 'do_rx_ddim', 'dws_rx_ddim'):
         method = DDPM.from_config(model, config, device)
+        if args.method == 'dws_rx_ddim':
+            if args.distilled_checkpoint is None:
+                raise ValueError("--distilled_checkpoint is required for dws_rx_ddim")
+            print(f"Loading distilled model from {args.distilled_checkpoint}...")
+            d_ckpt = torch.load(args.distilled_checkpoint, map_location=device)
+            distilled_model = create_model_from_config(config).to(device)
+            distilled_model.load_state_dict(d_ckpt['model'])
+            if 'ema' in d_ckpt and not args.no_ema:
+                d_ema = EMA(distilled_model, decay=config['training']['ema_decay'])
+                d_ema.load_state_dict(d_ckpt['ema'])
+                d_ema.apply_shadow()
+            distilled_model.eval()
+    elif args.method == 'pd':
+        ddpm_cfg = config['ddpm']
+        betas = torch.linspace(
+            ddpm_cfg['beta_start'], ddpm_cfg['beta_end'],
+            ddpm_cfg['num_timesteps'], dtype=torch.float32,
+        )
+        pd_alphas_cumprod = torch.cumprod(1.0 - betas, dim=0).to(device)
+        method = None
     elif args.method == 'flow_matching':
         method = FlowMatching.from_config(model, config, device)
     else:
-        raise ValueError(f"Unknown method: {args.method}. Supported: ddpm, ddim, flow_matching.")
+        raise ValueError(f"Unknown method: {args.method}. Supported: ddpm, ddim, pd, flow_matching.")
     
     # Apply EMA weights
     if not args.no_ema:
@@ -160,8 +225,9 @@ def main():
         ema.apply_shadow()
     else:
         print("Using training weights (no EMA)")
-    
-    method.eval_mode()
+
+    if method is not None:
+        method.eval_mode()
     
     # Image shape
     data_config = config['data']
@@ -183,9 +249,18 @@ def main():
         while remaining > 0:
             batch_size = min(args.batch_size, remaining)
 
-            num_steps = args.num_steps or config['sampling']['num_steps']
+            num_steps = args.num_steps
+            if num_steps is None:
+                num_steps = config.get('sampling', {}).get('num_steps', 1)
 
-            if args.method == 'ddim':
+            if args.method == 'pd':
+                samples = ddim_sample_v_pred(
+                    model, pd_alphas_cumprod, image_shape,
+                    num_steps=num_steps,
+                    batch_size=batch_size,
+                    device=device,
+                )
+            elif args.method == 'ddim':
                 samples = method.ddim_sample(
                     batch_size=batch_size,
                     image_shape=image_shape,
@@ -213,6 +288,21 @@ def main():
                     image_shape=image_shape,
                     num_steps=num_steps,
                     k=args.k,
+                    p1=args.p1,
+                    p2=args.p2,
+                    do_threshold=args.do_threshold,
+                )
+            elif args.method == 'dws_rx_ddim':
+                samples = method.dws_rx_ddim_sample(
+                    distilled_model=distilled_model,
+                    batch_size=batch_size,
+                    image_shape=image_shape,
+                    tau=args.dws_tau,
+                    n_rx_steps=args.n_rx_steps,
+                    k=args.k,
+                    extrapolation=args.extrapolation,
+                    tau_cng=args.tau,
+                    s_param=args.s_param,
                     p1=args.p1,
                     p2=args.p2,
                     do_threshold=args.do_threshold,

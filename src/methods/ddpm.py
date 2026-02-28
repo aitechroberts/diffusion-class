@@ -337,6 +337,14 @@ class DDPM(BaseMethod):
     #            with Multiple ODE Solutions", ICLR 2025
     # =========================================================================
 
+    @staticmethod
+    def tau_to_timestep(tau: float, alphas_cumprod: torch.Tensor) -> int:
+        """Map a noise-level fraction *tau* in [0, 1] to the nearest
+        diffusion timestep index whose forward-process noise std matches.
+        """
+        noise_levels = torch.sqrt(1.0 - alphas_cumprod)
+        return (noise_levels - tau).abs().argmin().item()
+
     @torch.no_grad()
     def _rx_ddim_core(
         self,
@@ -347,6 +355,8 @@ class DDPM(BaseMethod):
         extrapolate_fn: Callable[
             [torch.Tensor, torch.Tensor, List[float]], torch.Tensor
         ],
+        x_init: Optional[torch.Tensor] = None,
+        step_indices_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Shared RX-DDIM loop with a pluggable extrapolation strategy.
 
@@ -358,21 +368,32 @@ class DDPM(BaseMethod):
             extrapolate_fn: ``fn(x_k_step, x_1_step, lam_js) -> x``
                 where *lam_js* is the list of per-sub-step lambda values
                 in gamma-space.
+            x_init: Optional starting tensor.  When *None* (default),
+                sampling starts from pure Gaussian noise.
+            step_indices_override: Optional custom timestep schedule.
+                When *None*, an evenly-spaced schedule from T-1 to 0 is
+                built automatically.
 
         Returns:
             samples: (batch_size, C, H, W)
         """
         self.eval_mode()
 
-        step_indices = torch.linspace(
-            self.num_timesteps - 1, 0, num_steps + 1,
-        ).long().to(self.device)
+        if step_indices_override is not None:
+            step_indices = step_indices_override
+        else:
+            step_indices = torch.linspace(
+                self.num_timesteps - 1, 0, num_steps + 1,
+            ).long().to(self.device)
 
         gammas = torch.sqrt(
             (1.0 - self.alphas_cumprod) / self.alphas_cumprod
         )
 
-        x = torch.randn(batch_size, *image_shape, device=self.device)
+        if x_init is not None:
+            x = x_init
+        else:
+            x = torch.randn(batch_size, *image_shape, device=self.device)
 
         i = 0
         while i < num_steps:
@@ -603,6 +624,122 @@ class DDPM(BaseMethod):
 
         return self._rx_ddim_core(
             batch_size, image_shape, num_steps, k, _do_extrapolate,
+        )
+
+    # ----- Distillation Warm-Started RX-DDIM (DWS) -------------------------
+
+    @torch.no_grad()
+    def dws_rx_ddim_sample(
+        self,
+        distilled_model: nn.Module,
+        batch_size: int,
+        image_shape: Tuple[int, int, int],
+        tau: float = 0.3,
+        n_rx_steps: int = 2,
+        k: int = 2,
+        extrapolation: str = "standard",
+        tau_cng: float = 0.3,
+        s_param: float = 0.1,
+        p1: int = 2,
+        p2: int = 3,
+        do_threshold: float = 0.1,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Distillation Warm-Started RX-DDIM sampling.
+
+        Uses a distilled model for 1 NFE to produce a coarse x0 estimate,
+        re-noises it to an intermediate timestep controlled by *tau*, then
+        runs RX-DPM over the resulting short, well-conditioned trajectory.
+
+        Total NFE = 1 (distillation) + n_rx_steps.
+
+        Args:
+            distilled_model: A 1-step distilled model (same interface as
+                the base UNet — takes (x_t, t) and predicts eps).
+            batch_size: Number of samples to generate.
+            image_shape: (C, H, W).
+            tau: Noise-level fraction for re-noising (0 = no noise,
+                 1 = pure noise).  Typical sweet spot: 0.2-0.4.
+            n_rx_steps: Number of RX-DPM refinement steps (2 or 3).
+            k: Extrapolation interval for RX-DPM (k = 2 recommended).
+            extrapolation: Which extrapolation strategy to use for the
+                RX refinement pass: ``"standard"``, ``"cng"``, or
+                ``"do"``.
+            tau_cng: CNG sigmoid centre (only used when extrapolation="cng").
+            s_param: CNG sigmoid sharpness (only used when extrapolation="cng").
+            p1: DO primary error order (only used when extrapolation="do").
+            p2: DO secondary error order (only used when extrapolation="do").
+            do_threshold: DO disagreement threshold (only used when
+                extrapolation="do").
+
+        Returns:
+            samples: (batch_size, C, H, W)
+        """
+        self.eval_mode()
+        distilled_model.eval()
+
+        # --- Step 1: 1-NFE distilled estimate --------------------------------
+        # The distilled model uses v-prediction:  v = alpha*eps - sigma*x0
+        # so  x0 = alpha*z - sigma*v  (where alpha=sqrt(abar), sigma=sqrt(1-abar))
+        z = torch.randn(batch_size, *image_shape, device=self.device)
+        t_T = self.num_timesteps - 1
+        t_batch = torch.full(
+            (batch_size,), t_T, device=self.device, dtype=torch.long,
+        )
+        v_pred = distilled_model(z, t_batch)
+        abar_T = self.alphas_cumprod[t_T]
+        alpha_T = torch.sqrt(abar_T)
+        sigma_T = torch.sqrt(1.0 - abar_T)
+        x0_hat = alpha_T * z - sigma_T * v_pred
+
+        # --- Step 2: Re-noise to intermediate timestep -----------------------
+        t_start = self.tau_to_timestep(tau, self.alphas_cumprod)
+        t_start = max(t_start, 1)  # avoid t=0 which leaves no room to denoise
+        abar_start = self.alphas_cumprod[t_start]
+        epsilon = torch.randn_like(x0_hat)
+        x_tau = (
+            torch.sqrt(abar_start) * x0_hat
+            + torch.sqrt(1.0 - abar_start) * epsilon
+        )
+
+        # --- Step 3: Build short schedule and select extrapolation fn --------
+        step_indices = torch.linspace(
+            t_start, 0, n_rx_steps + 1,
+        ).long().to(self.device)
+
+        p_base = 2
+
+        if extrapolation == "cng":
+            def _extrapolate(x_k, x_1, lam_js):
+                S = sum(lj ** p_base for lj in lam_js)
+                kappa = abs(1.0 - S)
+                alpha = torch.sigmoid(
+                    torch.tensor((kappa - tau_cng) / s_param, device=x_k.device)
+                )
+                x_rx = (x_k - S * x_1) / (1.0 - S)
+                return alpha * x_rx + (1.0 - alpha) * x_k
+        elif extrapolation == "do":
+            def _extrapolate(x_k, x_1, lam_js):
+                S1 = sum(lj ** p1 for lj in lam_js)
+                S2 = sum(lj ** p2 for lj in lam_js)
+                x_rx1 = (x_k - S1 * x_1) / (1.0 - S1)
+                x_rx2 = (x_k - S2 * x_1) / (1.0 - S2)
+                disag = torch.norm(x_rx1 - x_rx2) / (torch.norm(x_k) + 1e-8)
+                a = torch.sigmoid(torch.tensor(
+                    (1.0 / (disag.item() + 1e-8) - 1.0 / do_threshold)
+                    * do_threshold,
+                    device=x_k.device,
+                ))
+                return a * x_rx1 + (1.0 - a) * x_k
+        else:
+            def _extrapolate(x_k, x_1, lam_js):
+                S = sum(lj ** p_base for lj in lam_js)
+                return (x_k - S * x_1) / (1.0 - S)
+
+        return self._rx_ddim_core(
+            batch_size, image_shape, n_rx_steps, k, _extrapolate,
+            x_init=x_tau,
+            step_indices_override=step_indices,
         )
 
     # =========================================================================

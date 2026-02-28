@@ -36,7 +36,7 @@ from tqdm import tqdm
 
 
 def load_model(checkpoint_path, device):
-    """Load checkpoint, apply EMA, return method + image_shape."""
+    """Load checkpoint, apply EMA, return method + image_shape + config."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
     from src.models import create_model_from_config
@@ -58,7 +58,25 @@ def load_model(checkpoint_path, device):
 
     data_cfg = config["data"]
     image_shape = (data_cfg["channels"], data_cfg["image_size"], data_cfg["image_size"])
-    return method, image_shape
+    return method, image_shape, config
+
+
+def load_distilled_model(checkpoint_path, config, device):
+    """Load a distilled model checkpoint, apply EMA, return nn.Module."""
+    from src.models import create_model_from_config
+    from src.utils import EMA
+
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    distilled = create_model_from_config(config).to(device)
+    distilled.load_state_dict(ckpt["model"])
+
+    if "ema" in ckpt:
+        ema = EMA(distilled, decay=config["training"]["ema_decay"])
+        ema.load_state_dict(ckpt["ema"])
+        ema.apply_shadow()
+
+    distilled.eval()
+    return distilled
 
 
 def save_individual_images(samples, output_dir, start_idx=0):
@@ -77,7 +95,14 @@ def save_individual_images(samples, output_dir, start_idx=0):
 
 def run_kid_mode(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    method, image_shape = load_model(args.checkpoint, device)
+    method, image_shape, config = load_model(args.checkpoint, device)
+
+    distilled_model = None
+    if args.method == "dws_rx_ddim":
+        if args.distilled_checkpoint is None:
+            raise ValueError("--distilled_checkpoint is required for dws_rx_ddim")
+        distilled_model = load_distilled_model(
+            args.distilled_checkpoint, config, device)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -104,6 +129,16 @@ def run_kid_mode(args):
                 samples = method.do_rx_ddim_sample(
                     batch_size=bs, image_shape=image_shape,
                     num_steps=args.num_steps, k=args.k,
+                    p1=args.p1, p2=args.p2,
+                    do_threshold=args.do_threshold,
+                )
+            elif args.method == "dws_rx_ddim":
+                samples = method.dws_rx_ddim_sample(
+                    distilled_model=distilled_model,
+                    batch_size=bs, image_shape=image_shape,
+                    tau=args.dws_tau, n_rx_steps=args.n_rx_steps,
+                    k=args.k, extrapolation=args.extrapolation,
+                    tau_cng=args.tau, s_param=args.s_param,
                     p1=args.p1, p2=args.p2,
                     do_threshold=args.do_threshold,
                 )
@@ -155,7 +190,12 @@ def run_kid_mode(args):
 
 def run_l2_mode(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    method, image_shape = load_model(args.checkpoint, device)
+    method, image_shape, config = load_model(args.checkpoint, device)
+
+    distilled_model = None
+    if args.distilled_checkpoint is not None:
+        distilled_model = load_distilled_model(
+            args.distilled_checkpoint, config, device)
 
     rx_steps = [int(s) for s in args.rx_step_counts.split(",")]
     n_samples = args.num_samples_l2
@@ -221,6 +261,19 @@ def run_l2_mode(args):
                 num_steps=ddim_n,
             ))
 
+            if distilled_model is not None:
+                _seed()
+                dws_nfe = 1 + rx_n  # 1 distilled + rx_n refinement
+                _record("dws_rx_ddim", dws_nfe, method.dws_rx_ddim_sample(
+                    distilled_model=distilled_model,
+                    batch_size=n_samples, image_shape=image_shape,
+                    tau=args.dws_tau, n_rx_steps=rx_n,
+                    k=args.k, extrapolation=args.extrapolation,
+                    tau_cng=args.tau, s_param=args.s_param,
+                    p1=args.p1, p2=args.p2,
+                    do_threshold=args.do_threshold,
+                ))
+
     # Sort by nfe for cleaner output
     rows.sort(key=lambda r: (r[2], r[0]))
 
@@ -247,7 +300,7 @@ def main():
 
     # KID mode args
     parser.add_argument("--method", type=str, default="ddim",
-                        choices=["ddim", "rx_ddim", "cng_rx_ddim", "do_rx_ddim"])
+                        choices=["ddim", "rx_ddim", "cng_rx_ddim", "do_rx_ddim", "dws_rx_ddim"])
     parser.add_argument("--num_steps", type=int, default=10)
     parser.add_argument("--num_samples", type=int, default=5000)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -265,6 +318,17 @@ def main():
                         help="DO-RX-DDIM: secondary error order for comparison")
     parser.add_argument("--do_threshold", type=float, default=0.1,
                         help="DO-RX-DDIM: disagreement threshold for gating")
+
+    # DWS-RX-DDIM args
+    parser.add_argument("--distilled_checkpoint", type=str, default=None,
+                        help="DWS-RX-DDIM: path to distilled model checkpoint")
+    parser.add_argument("--dws_tau", type=float, default=0.3,
+                        help="DWS-RX-DDIM: re-noising level")
+    parser.add_argument("--n_rx_steps", type=int, default=2,
+                        help="DWS-RX-DDIM: number of RX refinement steps")
+    parser.add_argument("--extrapolation", type=str, default="standard",
+                        choices=["standard", "cng", "do"],
+                        help="DWS-RX-DDIM: extrapolation strategy")
 
     # L2 mode args
     parser.add_argument("--rx_step_counts", type=str, default="1,5,10,25,50")
